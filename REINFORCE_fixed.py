@@ -1,3 +1,6 @@
+# Spring 2022, IOC 5259 Reinforcement Learning
+# HW1-partII: REINFORCE and baseline
+
 import gym
 from itertools import count
 from collections import namedtuple
@@ -11,11 +14,15 @@ from torch.distributions import Categorical
 import torch.optim.lr_scheduler as Scheduler
 
 import matplotlib.pyplot as plt
-#%matplotlib inline
 import time
 
-# Define a useful tuple (optional)
-SavedAction = namedtuple('SavedAction', ['log_prob', 'value'])
+##############################
+random_seed = 20  
+lr = 0.01
+environment = 'LunarLander-v2'
+# number of episode for 1 update
+batch_size = 4
+##############################
 
         
 class Policy(nn.Module):
@@ -45,9 +52,6 @@ class Policy(nn.Module):
         self.v1 = nn.Linear(16, 16)
         self.v2 = nn.Linear(16, 1)
         
-        # action & reward memory
-        self.saved_actions = []
-        self.rewards = []
 
     def forward(self, state):
         """
@@ -67,6 +71,9 @@ class Policy(nn.Module):
         v = F.relu(self.v1(x))
         state_value = F.relu(self.v2(v))
 
+        # action_prob -> torch.Tensor
+        # state_value -> torch.Tensor
+
         return action_prob, state_value
 
 
@@ -79,61 +86,54 @@ class Policy(nn.Module):
                 1. Implement the forward pass for both the action and the state value
         """
 
-        state = torch.FloatTensor(state).unsqueeze(0)
         probs, state_value = self.forward(state)
         m = Categorical(probs)
-        action = m.sample()        
-        
-        # save to action buffer
-        self.saved_actions.append(SavedAction(m.log_prob(action), state_value))
+        action = m.sample(batch_size)        
 
-        return action.item()
+        # action.item() -> int
+        # m.log_prob(action) -> torch.Tensor
+        # state_value -> torch.Tensor
 
+        return action, m.log_prob(action), state_value
 
-    def calculate_loss(self, gamma=0.99):
-        """
-            Calculate the loss (= policy loss + value loss) to perform backprop later
-            TODO:
-                1. Calculate rewards-to-go required by REINFORCE with the help of self.rewards
-                2. Calculate the policy loss using the policy gradient
-                3. Calculate the value loss using either MSE loss or smooth L1 loss
-        """
-        
-        # Initialize the lists and variables
-        R = 0
-        saved_actions = self.saved_actions
-        policy_losses = [] 
-        value_losses = [] 
-        returns = []
+def calculate_return(rewards, gamma=0.99):
+    # Tensor: rewards.shape = [N, batch_size]
+    rewards = torch.stack(rewards, axis=0)
+    # Tensor: reversed_rewards.shape = [N, batch_size]
+    reversed_rewards = torch.flip(rewards, dims=[0])
+    g_t = torch.zeros(batch_size)
+    gamma_list = torch.full(batch_size, gamma)
 
-        log_probs = torch.cat([a.log_prob for a in saved_actions])
-        values = torch.cat([a.value for a in saved_actions])
-
-        reversed_rewards = np.flip(self.rewards, 0)
-        g_t = 0
-        for r in reversed_rewards:
-            g_t = r + gamma * g_t
-            returns.insert(0, g_t)
-        
-        returns = torch.tensor(returns).float()
-        returns = torch.squeeze(returns)
-        values = torch.squeeze(values)
-
-        returns = (returns - returns.mean()) / (returns.std())
-
-        advantage = returns  - values
-        action_loss = sum(-log_probs * advantage)
-        value_loss = sum((returns - values)**2)
-        
-        return action_loss + value_loss
-
-    def clear_memory(self):
-        # reset rewards and action buffer
-        del self.rewards[:]
-        del self.saved_actions[:]
+    returns = []
+    for r in reversed_rewards.size(dim=0): # [N]
+        g_t = torch.add(r, torch.mul(gamma_list, g_t))
+        returns.insert(0, g_t.float())
+    
+    return torch.squeeze(returns)
 
 
-def train(lr=0.01, batch_size=20):
+def calculate_loss(log_probs, values, returns):
+    # log_probs = torch.cat(log_probs)
+    log_probs = torch.stack(log_probs, axis=0)
+    log_probs = torch.squeeze(log_probs, axis=0) # [N, batch_size]
+
+    values = torch.stack(values, axis=0)
+    values = torch.squeeze(values) # [N, batch_size]
+
+    returns = torch.tensor(returns)
+    returns = torch.stack(returns, axis=0) # [N, batch_size]
+
+    values = torch.squeeze(values)
+    returns =  torch.sub(returns, torch.mean(returns, 0)) / torch.std(returns, 0)
+
+    advantage = returns  - values
+    policy_lose = torch.sum(-log_probs * advantage, dim=0)
+    value_loss = torch.sum((returns - values)**2, dim=0)
+    
+    return policy_lose + value_loss
+
+
+def train(lr=0.01, batch_size=32):
     '''
         Train the model using SGD (via backpropagation)
         TODO: In each episode, 
@@ -147,11 +147,16 @@ def train(lr=0.01, batch_size=20):
     action_list = torch.empty(batch_size)
     reward_list = torch.empty(batch_size)
     done_list = torch.empty(batch_size)
-    t_list = torch.zeros(batch_size)
+    t_ep_list = torch.zeros(batch_size)
     cmp_list = torch.zeros(10, dtype=torch.bool)
     max_list = torch.full(batch_size, 9999)
+    ep_reward_list = torch.zeros(batch_size)
+    log_prob_list = torch.empty(batch_size)
+    value_list = torch.empty(batch_size)
+    returns_list = torch.zeros(batch_size)
+    # ones_list = torch.one(batch_size)
+    done_mask = torch.ones(batch_size)
 
-    
     print("goal: ", env.spec.reward_threshold)
     
     # Instantiate the policy model and the optimizer
@@ -162,64 +167,95 @@ def train(lr=0.01, batch_size=20):
     scheduler = Scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
     
     # EWMA reward for tracking the learning progress
-    ewma_reward = 0
+    ewma_reward_list = torch.zeros(batch_size)
+
     time_start = time.time()
     
     # run inifinitely many episodes
-    for i_episode in count(1):
-        ep_reward = 0
+    i_episode = 0
+
+    while True:
+        # reset environment and episode reward
+        ep_reward_list = torch.zeros(batch_size)
+        
+        log_probs = []
+        values = []
+        rewards = []
+        returns = []
+
+        # for i in range(batch_size):
         tmp_list = []
         for index in batch_size:
             # reset environment and episode reward
             tmp = env_list[index].reset()
+            # Tensor: tmp = [1, 8]
+            tmp = torch.FloatTensor(tmp).unsqueeze(0)
             tmp_list.append(tmp)
-        
-        state_list = torch.tensor(tmp_list)
-        t_list = torch.zeros(batch_size)
+        state_list = torch.stack(tmp_list)
+        state_list = torch.squeeze(state_list)
 
-        # Learning rate scheduler
-        scheduler.step()
-        
-        # For each episode, only run 9999 steps so that we don't 
-        # infinite loop while learning
+        t_ep_list = torch.zeros(batch_size)
+        t = 0
 
-        cmp_list = torch.lt(t_list, max_list)
-        cmp_list = torch.logical_and(cmp_list, torch.logical_not(done_list))
-        
-        while t_list[index] < 9999 or not done_list[index]:
-            t_list[index] += 1
-            action_list[index] = model.select_action(state_list[index])
-            state_list[index], reward_list[index], done_list[index], _ = env.step(action_list[index])
-            model.rewards.append(reward_list[index])
+        while torch.count_nonzero(done_mask).item() != 0:
+            torch.add(t_ep_list, 1)
+            # take a step
+            action_list, log_prob_list, value_list = model.select_action(state_list)
+
+            target = {'s_list': [], 'r_list': [], 'd_list': []}
+            for index in batch_size:
+                state, reward, done, _ = env_list[index].step(action_list[index].item())
+                target['s_list'].append(state)
+                target['r_list'].append(reward)
+                target['d_list'].append(done)
+            state_list = torch.stack(target['s_list'])
+            reward_list = torch.stack(target['r_list'])
+            done_list = torch.stack(target['d_list'])
+
+            # log data
+            log_probs.append(torch.mul(log_prob_list, done_mask))
+            values.append(torch.mul(value_list, done_mask))
+            rewards.append(torch.mul(reward_list, done_mask))
+
+            # update done_mask
+            cmp_list = torch.lt(t_ep_list, max_list)
+            done_mask = done_mask & (~done_list) & cmp_list
+
             # if done_list[index]:
             #     break
         
-        ep_reward = sum(model.rewards)
-        loss = model.calculate_loss()
+        t += torch.sum(t_ep_list)
+        ep_reward_list = torch.sum(rewards, dim=0)
+        returns += calculate_return(rewards)
+
+        loss = calculate_loss(log_probs, values, returns)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        model.clear_memory()
+        scheduler.step()
+
+        torch.div(ep_reward_list, batch_size)
+        t /= batch_size
             
         # update EWMA reward and log the results
-        ewma_reward = 0.05 * ep_reward + (1 - 0.05) * ewma_reward
-        print('Episode {}\tlength: {}\treward: {}\t ewma reward: {}'.format(i_episode, t, ep_reward, ewma_reward))
+        ewma_reward_list = torch.add(torch.mul(0.05, ep_reward_list), torch.mul((1 - 0.05), ewma_reward_list))
+        print('Episode {}\tlength: {}\treward: {}\t ewma reward: {}'.format(i_episode, t, torch.sum(ep_reward_list), torch.sum(ewma_reward_list)))
 
-        ER.append(ewma_reward)
-        R.append(ep_reward)
+        ER.append(torch.sum(ewma_reward_list))
+        R.append(torch.sum(ep_reward_list))
 
         # check if we have "solved" the cart pole problem
-        if ewma_reward > env.spec.reward_threshold or i_episode >= 2000:
+        if torch.sum(ewma_reward_list) > env.spec.reward_threshold or i_episode >= 2000:
             time_end = time.time()
             torch.save(model.state_dict(), './preTrained/LunarLander_{}.pth'.format(lr))
             print("Solved! Running reward is now {} and "
-                  "the last episode runs to {} time steps!".format(ewma_reward, t))
+                  "the last episode runs to {} time steps!".format(torch.sum(ewma_reward_list), t))
 
-            plt.plot(range(1, i_episode+1), R, 'r:')
-            plt.plot(range(1, i_episode+1), ER, 'b')
-            plt.legend(['ewma reward', 'ep reward'])
-            plt.savefig('LunarLander.png')
-            #plt.show()
+            # plt.plot(range(1, i_episode+1), R, 'r:')
+            # plt.plot(range(1, i_episode+1), ER, 'b')
+            # plt.legend(['ewma reward', 'ep reward'])
+            # plt.savefig('LunarLander.png')
+            # plt.show()
             time_c= time_end - time_start
             print('time cost', time_c, 's')
             break
@@ -230,6 +266,7 @@ def test(name, n_episodes=10):
         Test the learned model (no change needed)
     '''      
     model = Policy()
+    
     model.load_state_dict(torch.load('./preTrained/{}'.format(name)))
     
     render = True
@@ -242,8 +279,8 @@ def test(name, n_episodes=10):
             action = model.select_action(state)
             state, reward, done, _ = env.step(action)
             running_reward += reward
-            # if render:
-            #      env.render(mode='rgb_array')
+            if render:
+                 env.render()
             if done:
                 break
         print('Episode {}\tReward: {}'.format(i_episode, running_reward))
@@ -251,17 +288,16 @@ def test(name, n_episodes=10):
     
 
 if __name__ == '__main__':
-    # For reproducibility, fix the random seed
-    random_seed = 20  
     lr = 0.01
+    random_seed = 20 # Seed should be different among processes
     batch_size = 32
-
+    
     env_list = []
     for i in range(batch_size):
         env = gym.make('LunarLander-v2')
         env.seed(random_seed) 
         env_list.append(env)
-
+ 
     torch.manual_seed(random_seed)  
     train(lr, batch_size)
     test('LunarLander_0.01.pth')
