@@ -16,15 +16,16 @@ import torch.optim.lr_scheduler as Scheduler
 import matplotlib.pyplot as plt
 import time
 
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 ##############################
-random_seed = 20  
-lr = 0.01
-environment = 'LunarLander-v2'
+# random_seed = 4
+# lr = 0.01
+# environment = 'LunarLander-v2'
 # number of episode for 1 update
-batch_size = 4
+# batch_size = 4
 ##############################
 
-        
 class Policy(nn.Module):
     """
         Implement both policy network and the value network in one model
@@ -64,15 +65,12 @@ class Policy(nn.Module):
 
         x = F.relu(self.c1(state))
         x = F.relu(self.c2(x))
-
+        
         a = F.relu(self.a1(x))
         action_prob = F.softmax(self.a2(a), dim=1)
-
+        
         v = F.relu(self.v1(x))
         state_value = F.relu(self.v2(v))
-
-        # action_prob -> torch.Tensor
-        # state_value -> torch.Tensor
 
         return action_prob, state_value
 
@@ -85,55 +83,79 @@ class Policy(nn.Module):
             TODO:
                 1. Implement the forward pass for both the action and the state value
         """
+        state = state.to(device)
+        # Tensor: probs.shape = [32, 4]
+        probs, state_value = self.forward(state) # Tensor: state_value.shape = [32, 1] -> [32]
+#         print('state_value: ', state_value.shape)
+        state_value = state_value.squeeze(1) # Tensor: state_value.shape = [32]
 
-        probs, state_value = self.forward(state)
         m = Categorical(probs)
-        action = m.sample(batch_size)        
-
-        # action.item() -> int
-        # m.log_prob(action) -> torch.Tensor
-        # state_value -> torch.Tensor
-
+        action = m.sample() # Tensor: action.shape = [32]
+        
         return action, m.log_prob(action), state_value
 
-def calculate_return(rewards, gamma=0.99):
-    # Tensor: rewards.shape = [N, batch_size]
-    rewards = torch.stack(rewards, axis=0)
-    # Tensor: reversed_rewards.shape = [N, batch_size]
-    reversed_rewards = torch.flip(rewards, dims=[0])
-    g_t = torch.zeros(batch_size)
-    gamma_list = torch.full(batch_size, gamma)
+
+def calculate_return(rewards, t_ep_torch, gamma=0.99):
+    reversed_rewards = torch.flip(rewards, dims=[0]).to(device) # Tensor: reversed_rewards.shape = [N, 32]
+    g_t = torch.zeros(batch_size).to(device)
+    gamma_torch = torch.empty(batch_size).fill_(gamma).to(device)
 
     returns = []
-    for r in reversed_rewards.size(dim=0): # [N]
-        g_t = torch.add(r, torch.mul(gamma_list, g_t))
+    for batch in reversed_rewards: # [N]
+        g_t = torch.add(batch, torch.mul(gamma_torch, g_t))
         returns.insert(0, g_t.float())
+    returns = torch.stack(returns, axis=0) # Tensor: returns.shape = [N, 32]
     
-    return torch.squeeze(returns)
-
-
-def calculate_loss(log_probs, values, returns):
-    # log_probs = torch.cat(log_probs)
-    log_probs = torch.stack(log_probs, axis=0)
-    log_probs = torch.squeeze(log_probs, axis=0) # [N, batch_size]
-
-    values = torch.stack(values, axis=0)
-    values = torch.squeeze(values) # [N, batch_size]
-
-    returns = torch.tensor(returns)
-    returns = torch.stack(returns, axis=0) # [N, batch_size]
-
-    values = torch.squeeze(values)
-    returns =  torch.sub(returns, torch.mean(returns, 0)) / torch.std(returns, 0)
-
-    advantage = returns  - values
-    policy_lose = torch.sum(-log_probs * advantage, dim=0)
-    value_loss = torch.sum((returns - values)**2, dim=0)
+#     print('before returns: ', returns)
     
-    return policy_lose + value_loss
+    # handle the direction(padding) of returns
+#     print('returns: ', returns.shape)
+#     tmp = []
+#     returns = torch.split(returns, 1, dim=1)
+# #     print('split returns: ', returns)
+#     for i in range(0, len(returns)):
+#         print('returns[i]: ', returns[i])
+#         tmp.append(torch.roll(returns[i], -(len(returns[i]) - t_ep_torch[i].item()), 0)) # element move upward
+#     returns = torch.cat(tuple(tmp), 1)
+#     print('after returns: ', returns)
+    
+    return returns
 
 
-def train(lr=0.01, batch_size=32):
+def calculate_loss(log_probs, values, returns, t_ep_torch, batch_size):
+    log_probs = torch.stack(log_probs, axis=0).to(device)
+    values = torch.stack(values, axis=0).to(device)
+    # print('before returns: ', len(returns), ', ', returns[0].shape)
+    # returns = torch.stack(returns, axis=0).to(device)
+    # print('after returns: ', returns.shape)
+
+    returns = returns.to(device)
+    t_ep_torch = t_ep_torch.to(device)
+    
+    # mean = torch.sum(returns, dim=0) / torch.count_nonzero(returns, dim=0) # Tensor: mean.shape = [32]
+    # std = torch.sqrt(torch.sum((returns - mean)**2, dim=0) / torch.count_nonzero(returns, dim=0)) # Tensor: std.shape = [32]
+    mean = torch.sum(returns, dim=0) / t_ep_torch # Tensor: mean.shape = [32]
+    std = torch.sqrt(torch.sum((returns - mean)**2, dim=0) / t_ep_torch) # Tensor: std.shape = [32]
+
+    returns =  (returns - mean) / std  # Tensor: returns.shape = [N, 32]
+
+    advantage = returns - values # Tensor: advantage.shape = [N, 32]
+    # policy_lose = torch.sum(torch.mul(-log_probs, advantage), dim=0) # Tensor: policy_lose.shape = [32]
+    # value_loss = torch.sum(torch.sub(returns, values)**2, dim=0) # Tensor: value_loss.shape = [32]
+    
+    # loss = torch.sum(policy_lose + value_loss) / torch.sum(t_ep_torch)
+
+    policy_lose = torch.sum(torch.mul(-log_probs, advantage)) # Tensor: policy_lose.shape = [32]
+    value_loss = torch.sum(torch.sub(returns, values)**2) # Tensor: value_loss.shape = [32]
+    
+#     loss = (policy_lose + value_loss) / torch.sum(t_ep_torch)
+#     loss = (policy_lose + value_loss) / batch_size
+    loss = (policy_lose + value_loss)
+
+    return loss
+
+
+def train(env_list, number_of_episode_per_update, lr=0.01, batch_size=32):
     '''
         Train the model using SGD (via backpropagation)
         TODO: In each episode, 
@@ -143,121 +165,183 @@ def train(lr=0.01, batch_size=32):
     ER = []
     R = []
 
-    state_list = torch.empty(batch_size)
-    action_list = torch.empty(batch_size)
-    reward_list = torch.empty(batch_size)
-    done_list = torch.empty(batch_size)
-    t_ep_list = torch.zeros(batch_size)
-    cmp_list = torch.zeros(10, dtype=torch.bool)
-    max_list = torch.full(batch_size, 9999)
-    ep_reward_list = torch.zeros(batch_size)
-    log_prob_list = torch.empty(batch_size)
-    value_list = torch.empty(batch_size)
-    returns_list = torch.zeros(batch_size)
-    # ones_list = torch.one(batch_size)
-    done_mask = torch.ones(batch_size)
+    # t_ep_torch = torch.zeros(batch_size, dtype=torch.int)
 
     print("goal: ", env.spec.reward_threshold)
     
     # Instantiate the policy model and the optimizer
     model = Policy()
+    model.train()
+    model.to(device)
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     # Learning rate scheduler (optional)
     scheduler = Scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
     
     # EWMA reward for tracking the learning progress
-    ewma_reward_list = torch.zeros(batch_size)
+    ewma_reward = 0
+    ep_process = int(number_of_episode_per_update / batch_size)
+    remain = number_of_episode_per_update % batch_size
+    if remain > 0:
+        ep_process += 1
 
-    time_start = time.time()
+    
     
     # run inifinitely many episodes
     i_episode = 0
+    ep_reward = 0.0
+    action_time = 0.0
+    
+    time_start_total = time.time()
 
     while True:
-        # reset environment and episode reward
-        ep_reward_list = torch.zeros(batch_size)
+#         i_episode += (batch_size * ep_process)
+        i_episode += number_of_episode_per_update
+  
+        t = 0.0
+        loss = 0.0
         
-        log_probs = []
-        values = []
-        rewards = []
-        returns = []
-
-        # for i in range(batch_size):
-        tmp_list = []
-        for index in batch_size:
-            # reset environment and episode reward
-            tmp = env_list[index].reset()
-            # Tensor: tmp = [1, 8]
-            tmp = torch.FloatTensor(tmp).unsqueeze(0)
-            tmp_list.append(tmp)
-        state_list = torch.stack(tmp_list)
-        state_list = torch.squeeze(state_list)
-
-        t_ep_list = torch.zeros(batch_size)
-        t = 0
-
-        while torch.count_nonzero(done_mask).item() != 0:
-            torch.add(t_ep_list, 1)
-            # take a step
-            action_list, log_prob_list, value_list = model.select_action(state_list)
-
-            target = {'s_list': [], 'r_list': [], 'd_list': []}
-            for index in batch_size:
-                state, reward, done, _ = env_list[index].step(action_list[index].item())
-                target['s_list'].append(state)
-                target['r_list'].append(reward)
-                target['d_list'].append(done)
-            state_list = torch.stack(target['s_list'])
-            reward_list = torch.stack(target['r_list'])
-            done_list = torch.stack(target['d_list'])
-
-            # log data
-            log_probs.append(torch.mul(log_prob_list, done_mask))
-            values.append(torch.mul(value_list, done_mask))
-            rewards.append(torch.mul(reward_list, done_mask))
-
-            # update done_mask
-            cmp_list = torch.lt(t_ep_list, max_list)
-            done_mask = done_mask & (~done_list) & cmp_list
-
-            # if done_list[index]:
-            #     break
+        reward_list = []
         
-        t += torch.sum(t_ep_list)
-        ep_reward_list = torch.sum(rewards, dim=0)
-        returns += calculate_return(rewards)
+        # ========================= START TIME !!!!
+        time_start_action = time.time()
+        
+        
+        # ======================= START: MAINTAIN the SAME CALCULATION
+        for i in range(ep_process):
+            
+            
+            mask = torch.ones(batch_size, dtype=torch.int) # 0: done/ 1: keep going
+            mask = mask.to(device)
 
-        loss = calculate_loss(log_probs, values, returns)
+            t_ep_torch = torch.zeros(batch_size, dtype=torch.int)
+            t_ep_torch = t_ep_torch.to(device)
+
+            log_probs = []
+            values = []
+            rewards = []
+            ep_reward = 0.0
+
+            # reset environment
+            state_init = []
+            for index in range(batch_size):
+                state_i = env_list[index].reset()
+                state_i = torch.FloatTensor(state_i).unsqueeze(0) # Tensor: state_i.shape = [1, 8]
+                state_init.append(state_i)
+            state_torch = torch.stack(state_init, axis=0) # Tensor: state_torch.shape = [32, 1, 8]
+            state_torch = torch.squeeze(state_torch) # Tensor: state_torch.shape = [32, 8]
+            if state_torch.dim() == 1:
+                state_torch = torch.unsqueeze(state_torch, 0)
+
+            while torch.count_nonzero(mask).item() != 0:
+                t_ep_torch = torch.add(t_ep_torch, mask)
+
+                # Tensor: action_torch.shape = [32]
+                # Tensor: log_prob_torch.shape = [32]
+                # Tensor: value_torch.shape = [32]
+                action_torch, log_prob_torch, value_torch = model.select_action(state_torch)
+                action_torch = action_torch.to(device)
+                log_prob_torch = log_prob_torch.to(device)
+                value_torch = value_torch.to(device)
+                
+                state_list = []
+                reward_list = []
+                done_list = []
+                for index in range(batch_size):
+                    state, reward, done, _ = env_list[index].step(action_torch[index].item())
+
+                    # if (not done) & (mask[index]):
+                    if mask[index]:
+                        s = torch.tensor(state)
+                        r = torch.tensor(reward)
+                        d = torch.tensor(done)
+                    else:
+                        s = torch.tensor(state).detach()
+                        r = torch.tensor(reward).detach()
+                        d = torch.tensor(done).detach()
+
+                    state_list.append(s) # do not convert to tensor
+                    reward_list.append(r)
+                    done_list.append(d)
+                    
+                state_torch = torch.stack(state_list).to(device) # Tensor: state_torch.shape = [32, 8]
+                reward_torch = torch.stack(reward_list).to(device) # Tensor: reward_torch.shape = [32]
+                done_torch = torch.stack(done_list).to(device) # Tensor: done_torch.shape = [32]
+
+                # log data
+                log_probs.append(torch.mul(log_prob_torch, mask))
+                values.append(torch.mul(value_torch, mask))
+                rewards.append(torch.mul(reward_torch, mask))
+                
+                # update mask
+                cmp_torch = torch.lt(t_ep_torch, 9999)
+                mask = mask & (~done_torch) & cmp_torch
+
+            rewards = torch.stack(rewards, axis=0) # Tensor: rewards.shape = [N, 32] 
+            ep_reward += torch.sum(rewards)
+
+            returns = calculate_return(rewards, t_ep_torch) # Tensor: returns.shape = [N, 32]
+            loss += calculate_loss(log_probs, values, returns, t_ep_torch, batch_size) # Tensor: loss.shape = X
+
+            # how many ACTIONs per episode
+            t += torch.sum(t_ep_torch).detach()
+
+        # ======================= END: MAINTAIN the SAME CALCULATION
+
+        ep_reward /= (batch_size * ep_process)
+        t /= (batch_size * ep_process)
+#         loss /= ep_process => wrong
+#         loss /= (batch_size * ep_process)
+
         optimizer.zero_grad()
         loss.backward()
+
+        # ========================= END TIME !!!!
+        time_end_action = time.time()
+        time_c = time_end_action - time_start_action
+#         print('time cost', time_c, 's')
+        
+        action_time += time_c
+        
         optimizer.step()
         scheduler.step()
 
-        torch.div(ep_reward_list, batch_size)
-        t /= batch_size
-            
         # update EWMA reward and log the results
-        ewma_reward_list = torch.add(torch.mul(0.05, ep_reward_list), torch.mul((1 - 0.05), ewma_reward_list))
-        print('Episode {}\tlength: {}\treward: {}\t ewma reward: {}'.format(i_episode, t, torch.sum(ep_reward_list), torch.sum(ewma_reward_list)))
+        ewma_reward = 0.05 * ep_reward + (1 - 0.05) * ewma_reward
+#         print('Episode {}\tlength: {}\treward: {}\t ewma reward: {}'.format(i_episode, t, ep_reward, ewma_reward))
 
-        ER.append(torch.sum(ewma_reward_list))
-        R.append(torch.sum(ep_reward_list))
+        ER.append(ewma_reward.cpu().numpy())
+        R.append(ep_reward.cpu().numpy())
 
         # check if we have "solved" the cart pole problem
-        if torch.sum(ewma_reward_list) > env.spec.reward_threshold or i_episode >= 2000:
-            time_end = time.time()
-            torch.save(model.state_dict(), './preTrained/LunarLander_{}.pth'.format(lr))
-            print("Solved! Running reward is now {} and "
-                  "the last episode runs to {} time steps!".format(torch.sum(ewma_reward_list), t))
+#         if ewma_reward > env.spec.reward_threshold or i_episode >= 3000:
+        if i_episode >= 3000:
+            time_end_total = time.time()
+            total_time= time_end_total - time_start_total
+            
+            f = open("total_time.txt", "a")
+            f.write(f"{total_time}\n")
+            f.close()
+            
+            f = open("action_time.txt", "a")
+            f.write(f"{action_time}\n")
+            f.close()
+            
+            
+            
+            
+#             torch.save(model.state_dict(), './preTrained/LunarLander_{}.pth'.format(lr))
+#             print("Solved! Running reward is now {} and "
+#                   "the last episode runs to {} time steps!".format(torch.sum(ewma_reward), t))
 
-            # plt.plot(range(1, i_episode+1), R, 'r:')
-            # plt.plot(range(1, i_episode+1), ER, 'b')
-            # plt.legend(['ewma reward', 'ep reward'])
-            # plt.savefig('LunarLander.png')
-            # plt.show()
-            time_c= time_end - time_start
-            print('time cost', time_c, 's')
+#             plt.plot(range(1, len(R)+1), R, 'r:')
+#             plt.plot(range(1, len(ER)+1), ER, 'b')
+#             plt.legend(['ewma reward', 'ep reward'])
+#             plt.savefig('LunarLander.png')
+#             plt.show()
+            
+            
             break
 
 
@@ -274,23 +358,39 @@ def test(name, n_episodes=10):
     
     for i_episode in range(1, n_episodes+1):
         state = env.reset()
+        state = torch.FloatTensor(state).unsqueeze(0)
         running_reward = 0
         for t in range(max_episode_len+1):
-            action = model.select_action(state)
-            state, reward, done, _ = env.step(action)
+            action, _, _ = model.select_action(state)
+            state, reward, done, _ = env.step(action.item())
+            state = torch.tensor(state)
+            state = torch.unsqueeze(state, 0)
             running_reward += reward
-            if render:
-                 env.render()
+#             if render:
+#                  env.render()
             if done:
                 break
         print('Episode {}\tReward: {}'.format(i_episode, running_reward))
     env.close()
-    
+
 
 if __name__ == '__main__':
     lr = 0.01
-    random_seed = 20 # Seed should be different among processes
-    batch_size = 32
+     # Seed should be different for each batch_size
+#     random_seed = 7 # 1 -> 20/ 4 -> ?/ 8 -> ?/ 16 -> ?/ 32 -> ?
+#     random_seed = 4
+    random_seed = 20 # tried from 20 - 32 (when batch_size = 1)
+    batch_size = 8
+    
+    number_of_episode_per_update = 8
+    
+#     if torch.cuda.is_available():
+#         device = "cuda:0"
+#     else:
+#         device = "cpu"
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu' 
+        
+    device = torch.device(dev)
     
     env_list = []
     for i in range(batch_size):
@@ -299,5 +399,8 @@ if __name__ == '__main__':
         env_list.append(env)
  
     torch.manual_seed(random_seed)  
-    train(lr, batch_size)
-    test('LunarLander_0.01.pth')
+    for i in range(5):
+        train(env_list, number_of_episode_per_update, lr, batch_size)
+        
+    print("All Done!!!")
+#     test('LunarLander_0.01.pth')
